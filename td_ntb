@@ -1,0 +1,288 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
+
+void main() {
+  runApp(const MyApp());
+}
+
+enum Owner { player, enemy, neutral }
+
+enum TowerState { idle, active, max }
+
+class Tower {
+  final Offset position;
+  Owner owner;
+  int units;
+  List<Tower> links = [];
+  TowerState state = TowerState.idle;
+  Timer? productionTimer;
+
+  Tower({required this.position, required this.owner, required this.units});
+
+  void startProduction(VoidCallback onUpdate) {
+    productionTimer?.cancel();
+    productionTimer = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (links.isEmpty && state != TowerState.max) {
+        if (units < 63) {
+          units += 1; // pasívna produkcia
+        } else {
+          state = TowerState.max;
+        }
+        onUpdate();
+      }
+    });
+  }
+
+  void updateState() {
+    if (units >= 63) {
+      state = TowerState.max;
+    } else if (links.isNotEmpty) {
+      state = TowerState.active;
+    } else {
+      state = TowerState.idle;
+    }
+  }
+}
+
+class UnitStream {
+  final Tower from;
+  final Tower to;
+  double progress = 0;
+
+  UnitStream({required this.from, required this.to});
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: GameScreen(),
+    );
+  }
+}
+
+class GameScreen extends StatefulWidget {
+  const GameScreen({super.key});
+
+  @override
+  State<GameScreen> createState() => _GameScreenState();
+}
+
+class _GameScreenState extends State<GameScreen>
+    with SingleTickerProviderStateMixin {
+  late List<Tower> towers;
+  List<UnitStream> streams = [];
+  late Ticker ticker;
+
+  Tower? selectedTower;
+  Offset? dragPosition;
+
+  @override
+  void initState() {
+    super.initState();
+
+    towers = [
+      Tower(position: const Offset(100, 200), owner: Owner.player, units: 5),
+      Tower(position: const Offset(250, 200), owner: Owner.enemy, units: 4),
+      Tower(position: const Offset(175, 350), owner: Owner.neutral, units: 3),
+    ];
+
+    for (var t in towers) {
+      t.startProduction(() => setState(() {}));
+    }
+
+    ticker = createTicker(_update);
+    ticker.start();
+  }
+
+  void _update(Duration dt) {
+    setState(() {
+      // aktualizácia streamov
+      for (var s in streams) {
+        s.progress += 0.01;
+        if (s.progress >= 1) {
+          _arriveAtTower(s.to, s.from);
+          s.progress = 0; // opätovne začať, aby stream šiel stále
+        }
+      }
+
+      // aktualizuj stav veží
+      for (var t in towers) {
+        t.updateState();
+      }
+    });
+  }
+
+  void _arriveAtTower(Tower target, Tower source) {
+    if (source.owner == target.owner) {
+      target.units += 1;
+    } else {
+      if (target.units <= 1) {
+        target.units = 1;
+        target.owner = source.owner;
+      } else {
+        target.units -= 1;
+      }
+    }
+  }
+
+  void _createLink(Tower from, Tower to) {
+    if (from.links.length >= 3) return;
+    if (!from.links.contains(to)) {
+      from.links.add(to);
+    }
+    from.updateState();
+
+    // pridanie streamu pre vizualizáciu
+    Timer.periodic(const Duration(milliseconds: 500), (timer) {
+      if (!from.links.contains(to)) {
+        timer.cancel();
+        return;
+      }
+      streams.add(UnitStream(from: from, to: to));
+    });
+  }
+
+  Tower? _towerAtPosition(Offset pos) {
+    for (var t in towers) {
+      if ((t.position - pos).distance < 40) return t;
+    }
+    return null;
+  }
+
+  @override
+  void dispose() {
+    ticker.dispose();
+    for (var t in towers) {
+      t.productionTimer?.cancel();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: GestureDetector(
+        onPanStart: (details) {
+          Tower? t = _towerAtPosition(details.localPosition);
+          if (t != null && t.owner == Owner.player) {
+            selectedTower = t;
+            dragPosition = details.localPosition;
+            setState(() {});
+          }
+        },
+        onPanUpdate: (details) {
+          if (selectedTower != null) {
+            dragPosition = details.localPosition;
+            setState(() {});
+          }
+        },
+        onPanEnd: (details) {
+          if (selectedTower != null && dragPosition != null) {
+            Tower? target = _towerAtPosition(dragPosition!);
+            if (target != null && target != selectedTower) {
+              _createLink(selectedTower!, target);
+            }
+            selectedTower = null;
+            dragPosition = null;
+            setState(() {});
+          }
+        },
+        child: CustomPaint(
+          painter: GamePainter(towers, streams, selectedTower, dragPosition),
+          size: Size.infinite,
+        ),
+      ),
+    );
+  }
+}
+
+class GamePainter extends CustomPainter {
+  final List<Tower> towers;
+  final List<UnitStream> streams;
+  final Tower? selectedTower;
+  final Offset? dragPosition;
+
+  GamePainter(this.towers, this.streams, this.selectedTower, this.dragPosition);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final linePaint = Paint()
+      ..color = Colors.black12
+      ..strokeWidth = 2;
+
+    // vizualizácia streamov
+    for (var s in streams) {
+      final pos = Offset.lerp(s.from.position, s.to.position, s.progress)!;
+      canvas.drawCircle(pos, 5, Paint()..color = _towerColor(s.from.owner));
+    }
+
+    // linky
+    for (var t in towers) {
+      for (var l in t.links) {
+        canvas.drawLine(t.position, l.position, linePaint);
+      }
+    }
+
+    // drag vizualizácia
+    if (selectedTower != null && dragPosition != null) {
+      canvas.drawLine(
+        selectedTower!.position,
+        dragPosition!,
+        Paint()
+          ..color = Colors.yellow.withOpacity(0.7)
+          ..strokeWidth = 3,
+      );
+    }
+
+    // veže
+    for (var t in towers) {
+      final paint = Paint()..color = _towerColor(t.owner);
+      canvas.drawCircle(t.position, 30, paint);
+
+      if (t == selectedTower) {
+        canvas.drawCircle(
+          t.position,
+          36,
+          Paint()..color = Colors.yellow.withOpacity(0.5),
+        );
+      }
+
+      final text = t.state == TowerState.max ? "MAX" : t.units.toString();
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: text,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      textPainter.paint(
+        canvas,
+        t.position - Offset(textPainter.width / 2, textPainter.height / 2),
+      );
+    }
+  }
+
+  Color _towerColor(Owner owner) {
+    switch (owner) {
+      case Owner.player:
+        return Colors.blue;
+      case Owner.enemy:
+        return Colors.red;
+      case Owner.neutral:
+        return Colors.grey;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
