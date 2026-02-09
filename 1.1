@@ -1,0 +1,306 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+const int MAX_UNITS = 63;
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: GamePage(),
+    );
+  }
+}
+
+enum Owner { player, enemy, neutral }
+
+class GamePage extends StatefulWidget {
+  const GamePage({super.key});
+
+  @override
+  State<GamePage> createState() => _GamePageState();
+}
+
+class _GamePageState extends State<GamePage> {
+  late Timer timer;
+
+  List<Tower> towers = [];
+  List<Link> links = [];
+  List<Unit> units = [];
+
+  Tower? dragFrom;
+  Offset? dragPos;
+
+  @override
+  void initState() {
+    super.initState();
+
+    towers = [
+      Tower(id: 1, pos: const Offset(200, 600), owner: Owner.player),
+      Tower(id: 2, pos: const Offset(200, 120), owner: Owner.enemy),
+      Tower(id: 3, pos: const Offset(80, 360), owner: Owner.neutral),
+      Tower(id: 4, pos: const Offset(320, 360), owner: Owner.neutral),
+    ];
+
+    timer = Timer.periodic(const Duration(milliseconds: 16), _update);
+  }
+
+  void _update(Timer t) {
+    for (final tower in towers) {
+      tower.update(units, links);
+    }
+
+    for (final unit in units) {
+      unit.update();
+    }
+
+    units.removeWhere((u) => u.finished);
+    setState(() {});
+  }
+
+  Tower? _towerAt(Offset p) {
+    for (final t in towers) {
+      if ((t.pos - p).distance < 30) return t;
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: GestureDetector(
+        onPanStart: (d) {
+          dragFrom = _towerAt(d.localPosition);
+          dragPos = d.localPosition;
+        },
+        onPanUpdate: (d) {
+          dragPos = d.localPosition;
+
+          // preškrtnutie linky
+          links.removeWhere((l) =>
+              _distancePointToLine(
+                    d.localPosition,
+                    l.from.pos,
+                    l.to.pos,
+                  ) <
+                  10);
+        },
+        onPanEnd: (d) {
+          if (dragFrom != null && dragPos != null) {
+            final to = _towerAt(dragPos!);
+            if (to != null && to != dragFrom) {
+              // zruš LEN opačný smer medzi tými istými dvoma vežami
+              links.removeWhere(
+                  (l) => l.from == to && l.to == dragFrom);
+
+              // ak ešte neexistuje, pridaj
+              if (!links.any(
+                  (l) => l.from == dragFrom && l.to == to)) {
+                links.add(Link(dragFrom!, to));
+              }
+            }
+          }
+          dragFrom = null;
+          dragPos = null;
+        },
+        child: CustomPaint(
+          painter: GamePainter(
+            towers,
+            links,
+            units,
+            dragFrom,
+            dragPos,
+          ),
+          child: Container(),
+        ),
+      ),
+    );
+  }
+}
+
+/* ================= LOGIKA ================= */
+
+class Tower {
+  final int id;
+  final Offset pos;
+  Owner owner;
+
+  int unitCount = 5;
+  double idleTimer = 0;
+  double spawnTimer = 0;
+
+  Tower({
+    required this.id,
+    required this.pos,
+    required this.owner,
+  });
+
+  bool get isMax => unitCount >= MAX_UNITS;
+
+  int get lanes {
+    if (unitCount < 10) return 1;
+    if (unitCount < 30) return 2;
+    return 3;
+  }
+
+  void update(List<Unit> units, List<Link> links) {
+    final outgoing =
+        links.where((l) => l.from == this).toList();
+
+    // IDLE RAST
+    if (outgoing.isEmpty && !isMax) {
+      idleTimer += 0.016;
+      if (idleTimer >= 4) {
+        idleTimer = 0;
+        unitCount++;
+        if (unitCount > MAX_UNITS) unitCount = MAX_UNITS;
+      }
+    }
+
+    // STREAM
+    spawnTimer += 0.016;
+    if (spawnTimer >= 1) {
+      spawnTimer = 0;
+
+      for (final l in outgoing) {
+        for (int i = 0; i < lanes; i++) {
+          units.add(Unit(from: this, to: l.to));
+        }
+      }
+    }
+  }
+
+  void receive(Owner incoming) {
+    if (isMax) return;
+
+    if (incoming == owner) {
+      unitCount++;
+      if (unitCount > MAX_UNITS) unitCount = MAX_UNITS;
+    } else {
+      unitCount--;
+      if (unitCount <= 0) {
+        owner = incoming;
+        unitCount = 1;
+      }
+    }
+  }
+}
+
+class Link {
+  final Tower from;
+  final Tower to;
+
+  Link(this.from, this.to);
+}
+
+class Unit {
+  final Tower from;
+  final Tower to;
+  Offset pos;
+  bool finished = false;
+
+  Unit({required this.from, required this.to}) : pos = from.pos;
+
+  void update() {
+    final dir = to.pos - pos;
+    final dist = dir.distance;
+
+    if (dist < 3) {
+      to.receive(from.owner);
+      finished = true;
+      return;
+    }
+
+    pos += dir / dist * 1.5;
+  }
+}
+
+/* ================= DRAW ================= */
+
+class GamePainter extends CustomPainter {
+  final List<Tower> towers;
+  final List<Link> links;
+  final List<Unit> units;
+  final Tower? dragFrom;
+  final Offset? dragPos;
+
+  GamePainter(
+      this.towers, this.links, this.units, this.dragFrom, this.dragPos);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final linkPaint = Paint()
+      ..color = Colors.white24
+      ..strokeWidth = 3;
+
+    for (final l in links) {
+      canvas.drawLine(l.from.pos, l.to.pos, linkPaint);
+    }
+
+    if (dragFrom != null && dragPos != null) {
+      canvas.drawLine(
+        dragFrom!.pos,
+        dragPos!,
+        Paint()
+          ..color = Colors.white38
+          ..strokeWidth = 2,
+      );
+    }
+
+    for (final u in units) {
+      canvas.drawCircle(u.pos, 3, Paint()..color = Colors.white);
+    }
+
+    for (final t in towers) {
+      final color = t.owner == Owner.player
+          ? Colors.blue
+          : t.owner == Owner.enemy
+              ? Colors.red
+              : Colors.grey;
+
+      canvas.drawCircle(t.pos, 26, Paint()..color = color);
+
+      final label = t.isMax ? 'MAX' : t.unitCount.toString();
+
+      final tp = TextPainter(
+        text: TextSpan(
+            text: label,
+            style: const TextStyle(color: Colors.white)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      tp.paint(canvas, t.pos - Offset(tp.width / 2, 10));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
+/* ================= UTIL ================= */
+
+double _distancePointToLine(Offset p, Offset a, Offset b) {
+  final ap = p - a;
+  final ab = b - a;
+  final t =
+      (ap.dx * ab.dx + ap.dy * ab.dy) / ab.distanceSquared;
+  final tt = t.clamp(0.0, 1.0);
+  final closest = Offset(
+    a.dx + ab.dx * tt,
+    a.dy + ab.dy * tt,
+  );
+  return (p - closest).distance;
+}
