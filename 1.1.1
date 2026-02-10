@@ -1,0 +1,461 @@
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+// === KONFIG ===
+const int MAX_UNITS = 63; // MAX threshold
+const double UNIT_SPEED = 140.0; // px/s speed of visual unit
+const double TOUCH_RADIUS = 36.0; // tower hit radius
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: GameScreen(),
+    );
+  }
+}
+
+enum Owner { player, enemy, neutral }
+
+class Tower {
+  final int id;
+  Offset pos;
+  Owner owner;
+  int units;
+  bool get isMax => units >= MAX_UNITS;
+
+  // outgoing link targets (tower ids)
+  final Set<int> outgoing = {};
+
+  Tower({
+    required this.id,
+    required this.pos,
+    required this.owner,
+    required this.units,
+  });
+
+  int maxLinks() {
+    if (units >= 30) return 3;
+    if (units >= 10) return 2;
+    return 1;
+  }
+
+  void receive(Owner incoming) {
+    if (isMax) {
+      // in MAX we don't change the stored unit count
+      return;
+    }
+    if (incoming == owner) {
+      units = min(units + 1, MAX_UNITS);
+    } else {
+      units -= 1;
+      if (units <= 0) {
+        owner = incoming;
+        units = 1;
+      }
+    }
+  }
+}
+
+class Link {
+  final int from;
+  final int to;
+  Timer? timer;
+  Link(this.from, this.to);
+}
+
+class Unit {
+  int from;
+  int to;
+  Owner owner;
+  Offset pos;
+  bool finished = false;
+  Unit({
+    required this.from,
+    required this.to,
+    required this.owner,
+    required this.pos,
+  });
+}
+
+class GameScreen extends StatefulWidget {
+  const GameScreen({super.key});
+  @override
+  State<GameScreen> createState() => _GameScreenState();
+}
+
+class _GameScreenState extends State<GameScreen> {
+  final List<Tower> towers = [];
+  final List<Link> links = [];
+  final List<Unit> units = [];
+
+  // pendingUnits is a queue where timers push new units.
+  // They are moved into `units` at the start of the tick to avoid concurrent modification.
+  final List<Unit> _pendingUnits = [];
+
+  Timer? _globalTicker;
+  double _accumForPassive = 0.0;
+
+  // drag state
+  int? dragFrom;
+  Offset? dragPos;
+  bool eraseMode = false;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // initial 4 towers
+    towers.addAll([
+      Tower(id: 0, pos: const Offset(200, 150), owner: Owner.player, units: 5),
+      Tower(id: 1, pos: const Offset(100, 350), owner: Owner.neutral, units: 8),
+      Tower(
+        id: 2,
+        pos: const Offset(300, 350),
+        owner: Owner.neutral,
+        units: 12,
+      ),
+      Tower(id: 3, pos: const Offset(200, 560), owner: Owner.enemy, units: 15),
+    ]);
+
+    // start global ticker (~60fps)
+    _globalTicker = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      _tick(0.016);
+    });
+  }
+
+  void _tick(double dt) {
+    // 1) move pending units into main list (this is safe even if timers add while we iterate later)
+    if (_pendingUnits.isNotEmpty) {
+      units.addAll(_pendingUnits);
+      _pendingUnits.clear();
+    }
+
+    // 2) iterate units and update movement; collect arrivals and new spawned-from-arrivals separately
+    final List<Unit> arrived = [];
+    final List<Unit> spawnedFromArrivals = [];
+
+    for (final u in units) {
+      final Tower dst = towers.firstWhere((t) => t.id == u.to);
+      final dir = dst.pos - u.pos;
+      final dist = dir.distance;
+
+      if (dist < 4.0) {
+        // arrived
+        final List<Unit> newSpawned = _onUnitArrive(u, dst);
+        if (newSpawned.isNotEmpty) spawnedFromArrivals.addAll(newSpawned);
+        arrived.add(u);
+      } else {
+        // move
+        final move = UNIT_SPEED * dt;
+        u.pos = u.pos + (dir / dist) * move;
+      }
+    }
+
+    // 3) remove arrived units from main list
+    if (arrived.isNotEmpty) {
+      units.removeWhere((u) => arrived.contains(u));
+    }
+
+    // 4) append spawned units that were created as a result of arrivals (from MAX transit)
+    if (spawnedFromArrivals.isNotEmpty) {
+      units.addAll(spawnedFromArrivals);
+    }
+
+    // 5) passive production every 4s for towers with no outgoing and not max
+    _accumForPassive += dt;
+    if (_accumForPassive >= 4.0) {
+      _accumForPassive = 0.0;
+      for (final t in towers) {
+        final hasOutgoing = links.any((l) => l.from == t.id);
+        if (!hasOutgoing && !t.isMax) {
+          t.units = min(t.units + 1, MAX_UNITS);
+        }
+      }
+    }
+
+    setState(() {});
+  }
+
+  // returns a list of new units spawned as a result of arrival (e.g., transit through MAX)
+  List<Unit> _onUnitArrive(Unit u, Tower dst) {
+    final List<Unit> spawned = [];
+
+    if (dst.isMax) {
+      // transit: for each outgoing link of dst spawn a forwarded unit
+      final outgoing = links.where((l) => l.from == dst.id).toList();
+      for (final l in outgoing) {
+        // create unit starting at dst.pos targeting l.to
+        spawned.add(Unit(from: dst.id, to: l.to, owner: u.owner, pos: dst.pos));
+      }
+      return spawned;
+    }
+
+    // normal capture logic
+    if (u.owner == dst.owner) {
+      dst.units = min(dst.units + 1, MAX_UNITS);
+    } else {
+      dst.units -= 1;
+      if (dst.units <= 0) {
+        dst.owner = u.owner;
+        dst.units = 1;
+      }
+    }
+
+    return spawned;
+  }
+
+  int? _towerAt(Offset p) {
+    for (final t in towers) {
+      if ((t.pos - p).distance <= TOUCH_RADIUS) return t.id;
+    }
+    return null;
+  }
+
+  void _createLink(int fromId, int toId) {
+    final fromTower = towers.firstWhere((t) => t.id == fromId);
+    final toTower = towers.firstWhere((t) => t.id == toId);
+
+    // if opposite link exists: remove it (replacement behavior)
+    final oppIndex = links.indexWhere((l) => l.from == toId && l.to == fromId);
+    if (oppIndex != -1) {
+      _removeLinkAt(oppIndex);
+    }
+
+    // check source outgoing limit
+    final currentOutgoingCount = links.where((l) => l.from == fromId).length;
+    if (currentOutgoingCount >= fromTower.maxLinks()) {
+      // cannot add more links
+      return;
+    }
+
+    // don't duplicate
+    if (links.any((l) => l.from == fromId && l.to == toId)) return;
+
+    final link = Link(fromId, toId);
+    links.add(link);
+
+    // start spawn timer: every 1s enqueue a visual unit
+    link.timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      // read owners at spawn time
+      final src = towers.firstWhere((t) => t.id == fromId);
+      final ownerAtSpawn = src.owner;
+      // enqueue new visual unit into _pendingUnits (safe)
+      _pendingUnits.add(
+        Unit(from: fromId, to: toId, owner: ownerAtSpawn, pos: src.pos),
+      );
+    });
+  }
+
+  void _removeLinkAt(int index) {
+    final l = links[index];
+    l.timer?.cancel();
+    links.removeAt(index);
+  }
+
+  void _tryRemoveLinkAtPoint(Offset p) {
+    const threshold = 12.0;
+    for (int i = 0; i < links.length; i++) {
+      final l = links[i];
+      final a = towers.firstWhere((t) => t.id == l.from).pos;
+      final b = towers.firstWhere((t) => t.id == l.to).pos;
+      final d = _distToSegment(p, a, b);
+      if (d < threshold) {
+        _removeLinkAt(i);
+        return;
+      }
+    }
+  }
+
+  double _distToSegment(Offset p, Offset a, Offset b) {
+    final ap = p - a;
+    final ab = b - a;
+    final denom = ab.dx * ab.dx + ab.dy * ab.dy;
+    if (denom == 0) return (p - a).distance;
+    final t = (ap.dx * ab.dx + ap.dy * ab.dy) / denom;
+    final tt = t.clamp(0.0, 1.0);
+    final proj = Offset(a.dx + ab.dx * tt, a.dy + ab.dy * tt);
+    return (p - proj).distance;
+  }
+
+  @override
+  void dispose() {
+    for (final l in links) {
+      l.timer?.cancel();
+    }
+    _globalTicker?.cancel();
+    super.dispose();
+  }
+
+  // ---------- Input ----------
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onPanStart: (details) {
+        final p = details.localPosition;
+        final tId = _towerAt(p);
+        if (tId != null) {
+          // start link creation mode
+          dragFrom = tId;
+          eraseMode = false;
+          dragPos = p;
+        } else {
+          // start erase mode
+          dragFrom = null;
+          eraseMode = true;
+          dragPos = p;
+          _tryRemoveLinkAtPoint(p);
+        }
+        setState(() {});
+      },
+      onPanUpdate: (details) {
+        dragPos = details.localPosition;
+        if (eraseMode) {
+          _tryRemoveLinkAtPoint(dragPos!);
+        }
+        setState(() {});
+      },
+      onPanEnd: (details) {
+        if (!eraseMode && dragFrom != null && dragPos != null) {
+          final toId = _towerAt(dragPos!);
+          if (toId != null && toId != dragFrom) {
+            _createLink(dragFrom!, toId);
+          }
+        }
+        dragFrom = null;
+        dragPos = null;
+        eraseMode = false;
+        setState(() {});
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF0B0B0B),
+        body: CustomPaint(
+          size: Size.infinite,
+          painter: _GamePainter(
+            towers: towers,
+            links: links,
+            units: units,
+            dragFrom: dragFrom,
+            dragPos: dragPos,
+            eraseMode: eraseMode,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ========== Painter ==========
+class _GamePainter extends CustomPainter {
+  final List<Tower> towers;
+  final List<Link> links;
+  final List<Unit> units;
+  final int? dragFrom;
+  final Offset? dragPos;
+  final bool eraseMode;
+
+  _GamePainter({
+    required this.towers,
+    required this.links,
+    required this.units,
+    required this.dragFrom,
+    required this.dragPos,
+    required this.eraseMode,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paintLine = Paint()..strokeWidth = 4.0;
+    final paintUnit = Paint()..color = Colors.white;
+    // draw links
+    paintLine.color = Colors.white24;
+    for (final l in links) {
+      final a = towers.firstWhere((t) => t.id == l.from).pos;
+      final b = towers.firstWhere((t) => t.id == l.to).pos;
+      canvas.drawLine(a, b, paintLine);
+      _drawArrow(canvas, a, b);
+    }
+
+    // drag preview
+    if (dragFrom != null && dragPos != null) {
+      final a = towers.firstWhere((t) => t.id == dragFrom).pos;
+      paintLine.color = eraseMode ? Colors.redAccent : Colors.yellowAccent;
+      canvas.drawLine(a, dragPos!, paintLine..strokeWidth = 3.0);
+    }
+
+    // draw units (visual)
+    for (final u in units) {
+      paintUnit.color = (u.owner == Owner.player)
+          ? Colors.lightBlueAccent
+          : (u.owner == Owner.enemy)
+          ? Colors.redAccent
+          : Colors.white70;
+      canvas.drawCircle(u.pos, 4.0, paintUnit);
+    }
+
+    // draw towers
+    for (final t in towers) {
+      Color color;
+      switch (t.owner) {
+        case Owner.player:
+          color = Colors.blue;
+          break;
+        case Owner.enemy:
+          color = Colors.red;
+          break;
+        case Owner.neutral:
+        default:
+          color = Colors.grey;
+      }
+      final r = 30.0;
+      canvas.drawCircle(t.pos, r, Paint()..color = color);
+
+      // label
+      final label = t.isMax ? 'MAX' : t.units.toString();
+      final tp = TextPainter(
+        text: TextSpan(
+          text: label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      tp.paint(canvas, t.pos - Offset(tp.width / 2, tp.height / 2));
+    }
+  }
+
+  void _drawArrow(Canvas canvas, Offset a, Offset b) {
+    final dir = (b - a);
+    final dist = dir.distance;
+    if (dist < 20) return;
+    final unit = dir / dist;
+    final mid = a + unit * (dist * 0.52);
+    final perp = Offset(-unit.dy, unit.dx);
+    final arrowSize = 8.0;
+    final p1 = mid - unit * arrowSize + perp * (arrowSize * 0.6);
+    final p2 = mid - unit * arrowSize - perp * (arrowSize * 0.6);
+    final path = Path()
+      ..moveTo(mid.dx, mid.dy)
+      ..lineTo(p1.dx, p1.dy)
+      ..lineTo(p2.dx, p2.dy)
+      ..close();
+    canvas.drawPath(path, Paint()..color = Colors.white24);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
