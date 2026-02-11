@@ -1,0 +1,633 @@
+// main.dart
+import 'dart:async';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+// === KONFIG ===
+const int MAX_UNITS = 63;
+const double UNIT_SPEED = 140.0; // px/s
+const double TOUCH_RADIUS = 36.0;
+const double COLLISION_DISTANCE = 8.0; // threshold for unit collisions
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: GameScreen(),
+    );
+  }
+}
+
+enum Owner { player, enemy, neutral }
+
+class Tower {
+  final int id;
+  Offset pos;
+  Owner owner;
+  int units;
+  final bool isGuard;
+
+  Tower({
+    required this.id,
+    required this.pos,
+    required this.owner,
+    required this.units,
+    this.isGuard = false,
+  });
+
+  bool get isMax => units >= MAX_UNITS;
+
+  int maxLinks() {
+    if (units >= 30) return 3;
+    if (units >= 10) return 2;
+    return 1;
+  }
+
+  // guard params (scale with units)
+  double guardRange() {
+    if (units >= 30) return 180.0;
+    if (units >= 10) return 130.0;
+    return 90.0;
+  }
+
+  double guardInterval() {
+    if (units >= 30) return 0.7;
+    if (units >= 10) return 1.0;
+    return 1.2;
+  }
+
+  int guardShots() {
+    if (units >= 30) return 2;
+    return 1;
+  }
+
+  // receive arrival (capture logic)
+  void receive(Owner incoming) {
+    if (isMax) return;
+    if (incoming == owner) {
+      units = min(units + 1, MAX_UNITS);
+    } else {
+      units -= 1;
+      if (units <= 0) {
+        owner = incoming;
+        units = 1;
+      }
+    }
+  }
+}
+
+class Link {
+  final int from;
+  final int to;
+  double laneOffset;
+  Timer? timer;
+  Link({required this.from, required this.to, required this.laneOffset});
+}
+
+class Unit {
+  int from;
+  int to;
+  Owner owner;
+  Offset pos;
+  Unit({
+    required this.from,
+    required this.to,
+    required this.owner,
+    required this.pos,
+  });
+}
+
+class GameScreen extends StatefulWidget {
+  const GameScreen({super.key});
+  @override
+  State<GameScreen> createState() => _GameScreenState();
+}
+
+class _GameScreenState extends State<GameScreen> {
+  final List<Tower> towers = [];
+  final List<Link> links = [];
+  final List<Unit> units = [];
+
+  final List<Unit> _pendingUnits = [];
+
+  Timer? _globalTicker;
+  double _accumPassive = 0.0;
+
+  int? dragFrom;
+  Offset? dragPos;
+  bool eraseMode = false;
+
+  Timer? _aiTimer;
+
+  final Map<int, double> _guardAccum = {};
+
+  @override
+  void initState() {
+    super.initState();
+
+    // initial towers: player(0), guard neutral(1), neutral(2), enemy(3)
+    towers.addAll([
+      Tower(id: 0, pos: const Offset(200, 150), owner: Owner.player, units: 5),
+      Tower(id: 1, pos: const Offset(100, 350), owner: Owner.neutral, units: 8, isGuard: true),
+      Tower(id: 2, pos: const Offset(300, 350), owner: Owner.neutral, units: 12),
+      Tower(id: 3, pos: const Offset(200, 560), owner: Owner.enemy, units: 15),
+    ]);
+
+    for (final t in towers) _guardAccum[t.id] = 0.0;
+
+    _globalTicker = Timer.periodic(const Duration(milliseconds: 16), (_) {
+      _tick(0.016);
+    });
+
+    _aiTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _runAI();
+    });
+  }
+
+  @override
+  void dispose() {
+    for (final l in List<Link>.from(links)) {
+      l.timer?.cancel();
+    }
+    _globalTicker?.cancel();
+    _aiTimer?.cancel();
+    super.dispose();
+  }
+
+  void _tick(double dt) {
+    // 0) add pending units
+    if (_pendingUnits.isNotEmpty) {
+      units.addAll(_pendingUnits);
+      _pendingUnits.clear();
+    }
+
+    // 1) move units
+    for (final u in units) {
+      final dst = towers.firstWhere((t) => t.id == u.to);
+      final dir = dst.pos - u.pos;
+      final dist = dir.distance;
+      if (dist > 0.0001) {
+        final move = UNIT_SPEED * dt;
+        u.pos = u.pos + (dir / dist) * min(move, dist);
+      }
+    }
+
+    // 2) collisions on same segment with resolution by tower strength
+    final Set<Unit> toRemoveByCollision = {};
+    final Map<String, List<Unit>> bySegment = {};
+    for (final u in units) {
+      final a = u.from;
+      final b = u.to;
+      final key = (a < b) ? '$a-$b' : '$b-$a';
+      bySegment.putIfAbsent(key, () => []).add(u);
+    }
+
+    for (final entry in bySegment.entries) {
+      final segUnits = entry.value;
+      final Map<String, List<Unit>> dirMap = {};
+      for (final u in segUnits) {
+        final k = '${u.from}->${u.to}';
+        dirMap.putIfAbsent(k, () => []).add(u);
+      }
+      final keys = dirMap.keys.toList();
+      for (int i = 0; i < keys.length; i++) {
+        for (int j = i + 1; j < keys.length; j++) {
+          final k1 = keys[i];
+          final k2 = keys[j];
+          final parts1 = k1.split('->');
+          final parts2 = k2.split('->');
+          final f1 = int.parse(parts1[0]);
+          final t1 = int.parse(parts1[1]);
+          final f2 = int.parse(parts2[0]);
+          final t2 = int.parse(parts2[1]);
+          if (!(f1 == t2 && t1 == f2)) continue; // must be opposite directions
+          final listA = dirMap[k1]!;
+          final listB = dirMap[k2]!;
+          for (final uA in listA) {
+            if (toRemoveByCollision.contains(uA)) continue;
+            for (final uB in listB) {
+              if (toRemoveByCollision.contains(uB)) continue;
+              if (uA.owner == uB.owner) continue; // same owner -> no fight
+              final d = (uA.pos - uB.pos).distance;
+              if (d <= COLLISION_DISTANCE) {
+                // resolution by originating tower strength
+                final towerA = towers.firstWhere((t) => t.id == uA.from);
+                final towerB = towers.firstWhere((t) => t.id == uB.from);
+                if (towerA.units > towerB.units) {
+                  // A stronger -> B dies
+                  toRemoveByCollision.add(uB);
+                } else if (towerA.units < towerB.units) {
+                  // B stronger -> A dies
+                  toRemoveByCollision.add(uA);
+                } else {
+                  // equal -> both die
+                  toRemoveByCollision.add(uA);
+                  toRemoveByCollision.add(uB);
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (toRemoveByCollision.isNotEmpty) units.removeWhere((u) => toRemoveByCollision.contains(u));
+
+    // 3) arrivals
+    final List<Unit> arrived = [];
+    for (final u in units) {
+      final dst = towers.firstWhere((t) => t.id == u.to);
+      final dist = (dst.pos - u.pos).distance;
+      if (dist < 4.0) arrived.add(u);
+    }
+
+    // 4) process arrivals (and collect spawned)
+    final List<Unit> spawnedFromArrivals = [];
+    if (arrived.isNotEmpty) {
+      for (final u in arrived) {
+        final dst = towers.firstWhere((t) => t.id == u.to);
+        final spawned = _onUnitArrive(u, dst);
+        if (spawned.isNotEmpty) spawnedFromArrivals.addAll(spawned);
+      }
+      units.removeWhere((u) => arrived.contains(u));
+    }
+    if (spawnedFromArrivals.isNotEmpty) units.addAll(spawnedFromArrivals);
+
+    // 5) guard towers shoot: first visual units, else damage towers
+    final Set<Unit> toRemoveByGuards = {};
+    final List<_TowerDamage> towerDamages = [];
+    for (final tower in towers.where((t) => t.isGuard)) {
+      _guardAccum[tower.id] = (_guardAccum[tower.id] ?? 0) + dt;
+      final interval = tower.guardInterval();
+      if (_guardAccum[tower.id]! >= interval) {
+        _guardAccum[tower.id] = 0.0;
+        final range = tower.guardRange();
+        // find visual unit candidates in range with different owner
+        final candidates = units.where((u) => u.owner != tower.owner && (u.pos - tower.pos).distance <= range).toList();
+        if (candidates.isNotEmpty) {
+          candidates.sort((a, b) => (a.pos - tower.pos).distance.compareTo((b.pos - tower.pos).distance));
+          final shots = tower.guardShots();
+          for (int i = 0; i < min(shots, candidates.length); i++) {
+            toRemoveByGuards.add(candidates[i]);
+          }
+        } else {
+          // no visual units -> shoot at enemy towers in range (damage)
+          final towerTargets = towers.where((tt) => tt.id != tower.id && tt.owner != tower.owner && (tt.pos - tower.pos).distance <= range).toList();
+          if (towerTargets.isNotEmpty) {
+            towerTargets.sort((a, b) => (a.pos - tower.pos).distance.compareTo((b.pos - tower.pos).distance));
+            final shots = tower.guardShots();
+            for (int i = 0; i < min(shots, towerTargets.length); i++) {
+              towerDamages.add(_TowerDamage(targetId: towerTargets[i].id, damage: 1, shooterOwner: tower.owner));
+            }
+          }
+        }
+      }
+    }
+    if (toRemoveByGuards.isNotEmpty) units.removeWhere((u) => toRemoveByGuards.contains(u));
+    if (towerDamages.isNotEmpty) {
+      for (final dmg in towerDamages) {
+        final tgt = towers.firstWhere((t) => t.id == dmg.targetId);
+        // apply damage: reduce units; if <=0 flip owner and set units=1
+        tgt.units -= dmg.damage;
+        if (tgt.units <= 0) {
+          tgt.owner = dmg.shooterOwner;
+          tgt.units = 1;
+        }
+        if (tgt.units < 0) tgt.units = 0;
+      }
+    }
+
+    // 6) passive production every 4s — guard towers do NOT produce
+    _accumPassive += dt;
+    if (_accumPassive >= 4.0) {
+      _accumPassive = 0.0;
+      for (final t in towers) {
+        if (t.isGuard) continue;
+        final hasOutgoing = links.any((l) => l.from == t.id);
+        if (!hasOutgoing && !t.isMax) {
+          t.units = min(t.units + 1, MAX_UNITS);
+        }
+      }
+    }
+
+    setState(() {});
+  }
+
+  List<Unit> _onUnitArrive(Unit u, Tower dst) {
+    final List<Unit> spawned = [];
+    if (dst.isMax) {
+      final outgoing = links.where((l) => l.from == dst.id).toList();
+      for (final l in outgoing) {
+        final tgt = towers.firstWhere((t) => t.id == l.to);
+        final spawnPos = _spawnPositionWithOffset(dst.pos, tgt.pos, l.laneOffset);
+        spawned.add(Unit(from: dst.id, to: l.to, owner: u.owner, pos: spawnPos));
+      }
+      return spawned;
+    }
+    // normal capture logic
+    if (u.owner == dst.owner) {
+      dst.units = min(dst.units + 1, MAX_UNITS);
+    } else {
+      dst.units -= 1;
+      if (dst.units <= 0) {
+        dst.owner = u.owner;
+        dst.units = 1;
+      }
+    }
+    return spawned;
+  }
+
+  Offset _spawnPositionWithOffset(Offset src, Offset dst, double laneOffset) {
+    final dir = dst - src;
+    final dist = dir.distance;
+    if (dist == 0) return src;
+    final unit = dir / dist;
+    final perp = Offset(-unit.dy, unit.dx);
+    return src + perp * laneOffset;
+  }
+
+  int? _towerAt(Offset p) {
+    for (final t in towers) {
+      if ((t.pos - p).distance <= TOUCH_RADIUS) return t.id;
+    }
+    return null;
+  }
+
+  void _createLink(int fromId, int toId) {
+    final fromTower = towers.firstWhere((t) => t.id == fromId);
+    if (fromTower.isGuard) return; // guard cannot create links
+
+    final currentOutgoing = links.where((l) => l.from == fromId).length;
+    if (currentOutgoing >= fromTower.maxLinks()) return;
+    if (links.any((l) => l.from == fromId && l.to == toId)) return;
+
+    final newCount = currentOutgoing + 1;
+    final spacing = 12.0;
+    final index = currentOutgoing;
+    final offset = (index - (newCount - 1) / 2.0) * spacing;
+
+    final link = Link(from: fromId, to: toId, laneOffset: offset);
+    links.add(link);
+
+    link.timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final src = towers.firstWhere((t) => t.id == fromId);
+      final dst = towers.firstWhere((t) => t.id == toId);
+      final spawnPos = _spawnPositionWithOffset(src.pos, dst.pos, link.laneOffset);
+      final ownerAtSpawn = src.owner;
+      _pendingUnits.add(Unit(from: fromId, to: toId, owner: ownerAtSpawn, pos: spawnPos));
+    });
+  }
+
+  void _removeLinkAt(int index) {
+    if (index < 0 || index >= links.length) return;
+    final l = links[index];
+    l.timer?.cancel();
+    links.removeAt(index);
+  }
+
+  void _tryRemoveLinkAtPoint(Offset p) {
+    const threshold = 12.0;
+    for (int i = 0; i < links.length; i++) {
+      final l = links[i];
+      final a = towers.firstWhere((t) => t.id == l.from).pos;
+      final b = towers.firstWhere((t) => t.id == l.to).pos;
+      final d = _distToSegment(p, a, b);
+      if (d < threshold) {
+        _removeLinkAt(i);
+        return;
+      }
+    }
+  }
+
+  double _distToSegment(Offset p, Offset a, Offset b) {
+    final ap = p - a;
+    final ab = b - a;
+    final denom = ab.dx * ab.dx + ab.dy * ab.dy;
+    if (denom == 0) return (p - a).distance;
+    final t = (ap.dx * ab.dx + ap.dy * ab.dy) / denom;
+    final tt = t.clamp(0.0, 1.0);
+    final proj = Offset(a.dx + ab.dx * tt, a.dy + ab.dy * tt);
+    return (p - proj).distance;
+  }
+
+  void _runAI() {
+    for (final src in towers.where((t) => t.owner == Owner.enemy && !t.isGuard)) {
+      final currentOutgoing = links.where((l) => l.from == src.id).length;
+      final allowed = src.maxLinks();
+      if (currentOutgoing >= allowed) continue;
+
+      final candidates = towers.where((t) => t.id != src.id && t.owner != Owner.enemy).toList();
+      if (candidates.isEmpty) continue;
+
+      double bestScore = double.infinity;
+      Tower? best;
+      for (final cand in candidates) {
+        if (links.any((l) => l.from == src.id && l.to == cand.id)) continue;
+        final dist = (cand.pos - src.pos).distance;
+        final score = dist * 0.6 + cand.units * 1.4;
+        if (score < bestScore) {
+          bestScore = score;
+          best = cand;
+        }
+      }
+      if (best != null) _createLink(src.id, best.id);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onPanStart: (details) {
+        final p = details.localPosition;
+        final tId = _towerAt(p);
+        if (tId != null) {
+          final tower = towers.firstWhere((t) => t.id == tId);
+          if (tower.isGuard) {
+            dragFrom = null;
+            eraseMode = false;
+            dragPos = null;
+            setState(() {});
+            return;
+          }
+          dragFrom = tId;
+          eraseMode = false;
+          dragPos = p;
+        } else {
+          dragFrom = null;
+          eraseMode = true;
+          dragPos = p;
+          _tryRemoveLinkAtPoint(p);
+        }
+        setState(() {});
+      },
+      onPanUpdate: (details) {
+        dragPos = details.localPosition;
+        if (eraseMode) _tryRemoveLinkAtPoint(dragPos!);
+        setState(() {});
+      },
+      onPanEnd: (details) {
+        if (!eraseMode && dragFrom != null && dragPos != null) {
+          final toId = _towerAt(dragPos!);
+          if (toId != null && toId != dragFrom) _createLink(dragFrom!, toId);
+        }
+        dragFrom = null;
+        dragPos = null;
+        eraseMode = false;
+        setState(() {});
+      },
+      child: Scaffold(
+        backgroundColor: const Color(0xFF0B0B0B),
+        body: CustomPaint(
+          size: Size.infinite,
+          painter: GamePainter(
+            towers: towers,
+            links: links,
+            units: units,
+            dragFrom: dragFrom,
+            dragPos: dragPos,
+            eraseMode: eraseMode,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _TowerDamage {
+  final int targetId;
+  final int damage;
+  final Owner shooterOwner;
+  _TowerDamage({required this.targetId, required this.damage, required this.shooterOwner});
+}
+
+class GamePainter extends CustomPainter {
+  final List<Tower> towers;
+  final List<Link> links;
+  final List<Unit> units;
+  final int? dragFrom;
+  final Offset? dragPos;
+  final bool eraseMode;
+
+  GamePainter({
+    required this.towers,
+    required this.links,
+    required this.units,
+    required this.dragFrom,
+    required this.dragPos,
+    required this.eraseMode,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final linkPaint = Paint()..strokeWidth = 3.0;
+    final unitPaint = Paint();
+
+    // draw links
+    linkPaint.color = Colors.white24;
+    for (final l in links) {
+      final a = towers.firstWhere((t) => t.id == l.from).pos;
+      final b = towers.firstWhere((t) => t.id == l.to).pos;
+      canvas.drawLine(a, b, linkPaint);
+      _drawArrow(canvas, a, b);
+    }
+
+    // draw guard ranges
+    for (final t in towers.where((t) => t.isGuard)) {
+      final range = t.guardRange();
+      final rPaint = Paint()..color = Colors.orange.withOpacity(0.12);
+      canvas.drawCircle(t.pos, range, rPaint);
+    }
+
+    // draw drag preview
+    if (dragFrom != null && dragPos != null) {
+      final a = towers.firstWhere((t) => t.id == dragFrom).pos;
+      linkPaint.color = eraseMode ? Colors.redAccent : Colors.yellowAccent;
+      canvas.drawLine(a, dragPos!, linkPaint..strokeWidth = 3.0);
+    }
+
+    // draw units
+    for (final u in units) {
+      if (u.owner == Owner.player) unitPaint.color = Colors.lightBlueAccent;
+      else if (u.owner == Owner.enemy) unitPaint.color = Colors.redAccent;
+      else unitPaint.color = Colors.white70;
+      canvas.drawCircle(u.pos, 4.0, unitPaint);
+    }
+
+    // draw towers (guard visually distinct)
+    for (final t in towers) {
+      if (t.isGuard) {
+        // base circle
+        canvas.drawCircle(t.pos, 30.0, Paint()..color = Colors.grey.shade700);
+        // turret box
+        final rect = Rect.fromCenter(center: t.pos - const Offset(0, 8), width: 18, height: 18);
+        // color indicates owner
+        Color turretColor;
+        switch (t.owner) {
+          case Owner.player:
+            turretColor = Colors.blueAccent;
+            break;
+          case Owner.enemy:
+            turretColor = Colors.redAccent;
+            break;
+          case Owner.neutral:
+          default:
+            turretColor = Colors.orangeAccent;
+        }
+        canvas.drawRect(rect, Paint()..color = turretColor);
+        // label under
+        final tp = TextPainter(
+          text: TextSpan(text: t.isMax ? 'MAX' : t.units.toString(), style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        tp.paint(canvas, t.pos + const Offset(-12, 22));
+      } else {
+        Color color;
+        switch (t.owner) {
+          case Owner.player:
+            color = Colors.blue;
+            break;
+          case Owner.enemy:
+            color = Colors.red;
+            break;
+          case Owner.neutral:
+          default:
+            color = Colors.grey;
+        }
+        canvas.drawCircle(t.pos, 30.0, Paint()..color = color);
+
+        final tp = TextPainter(
+          text: TextSpan(text: t.isMax ? 'MAX' : t.units.toString(), style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        tp.paint(canvas, t.pos - Offset(tp.width / 2, tp.height / 2));
+      }
+    }
+  }
+
+  void _drawArrow(Canvas canvas, Offset a, Offset b) {
+    final dir = (b - a);
+    final dist = dir.distance;
+    if (dist < 20) return;
+    final unit = dir / dist;
+    final mid = a + unit * (dist * 0.52);
+    final perp = Offset(-unit.dy, unit.dx);
+    final arrowSize = 8.0;
+    final p1 = mid - unit * arrowSize + perp * (arrowSize * 0.6);
+    final p2 = mid - unit * arrowSize - perp * (arrowSize * 0.6);
+    final path = Path()..moveTo(mid.dx, mid.dy)..lineTo(p1.dx, p1.dy)..lineTo(p2.dx, p2.dy)..close();
+    canvas.drawPath(path, Paint()..color = Colors.white24);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
